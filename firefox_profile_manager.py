@@ -25,8 +25,15 @@ A small PyQt6 utility to:
   4. Restore a profile from a previous backup
 
 Nothing here touches Windows itself - it only ever works inside the
-Firefox profile folder, and every destructive action is preceded by
-an automatic backup (unless you explicitly skip it).
+Firefox profile folder, and every destructive action is reversible:
+cleaning takes an automatic backup first (unless you untick it) and
+writes a forensic snapshot, while restoring keeps the profile it
+replaced alongside as '<name>.pre-restore-<timestamp>'.
+
+Write operations are refused while Firefox holds the profile, and also
+if that cannot be determined. Each destructive function enforces this
+itself rather than trusting the caller, so a long backup cannot open a
+window in which Firefox starts and the later steps proceed anyway.
 
 Install:
     pip install PyQt6
@@ -76,6 +83,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+__version__ = "1.0.0"
 
 APP_TITLE = "Firefox Profile Manager"
 FLAG_EMOJI = "\u26a0\ufe0f"
@@ -596,6 +605,25 @@ def profile_lock_state(profile_path: Path) -> LockState:
         return LockState.UNKNOWN
 
 
+def require_profile_writable(profile_path: Path):
+    """Raise unless this profile is verifiably not in use.
+
+    Called by every destructive primitive rather than trusting the caller.
+    The GUI's ensure_writable() check happens when the button is clicked,
+    but cleanup can run for minutes afterwards - a full backup on a large
+    profile is slow - and Firefox may be launched in that window. A check
+    at the top of the sequence says nothing about the state at the bottom
+    of it, so each primitive re-establishes the invariant immediately
+    before it writes.
+
+    This makes the GUI check a convenience and this function the actual
+    boundary.
+    """
+    state = profile_lock_state(profile_path)
+    if state is not LockState.FREE:
+        raise RuntimeError(describe_lock_state(state))
+
+
 def describe_lock_state(state: LockState) -> str:
     if state is LockState.FREE:
         return "Profile is not in use."
@@ -761,7 +789,7 @@ def backup_profile(profile_path: Path, dest_dir: Path, log,
             "format_version": BACKUP_FORMAT_VERSION,
             "profile": profile_path.name,
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "tool": APP_TITLE,
+            "tool": f"{APP_TITLE} {__version__}",
         }, indent=2))
         for root, _dirs, files in os.walk(profile_path):
             for fname in files:
@@ -880,10 +908,19 @@ def inspect_backup_archive(zip_path: Path, expected_profile: str | None = None):
                 "wrong profile. Select the matching profile first."
             )
 
-        names = {re.split(r"[\\/]", i.filename, 1)[-1] for i in infos}
+        # Names relative to the profile folder. Matching on suffix was wrong:
+        # 'junk/prefs.js'.endswith('prefs.js') is True, so an archive with
+        # everything buried in a subfolder passed validation while not being
+        # a viable profile - Firefox requires prefs.js at the profile root.
+        relative = {
+            re.split(r"[\\/]", i.filename, 1)[-1].replace("\\", "/")
+            for i in infos if i.filename != BACKUP_MANIFEST_NAME
+        }
+        root_names = {n for n in relative if "/" not in n}
 
-        def has(*suffixes):
-            return any(n.endswith(s) for n in names for s in suffixes)
+        def has(*wanted):
+            """True if any of these sit at the profile root."""
+            return any(n in root_names for n in wanted)
 
         # Structural safety is not enough: an archive can be perfectly
         # contained and still not be a Firefox profile. Restoring replaces
@@ -891,9 +928,9 @@ def inspect_backup_archive(zip_path: Path, expected_profile: str | None = None):
         # destroy a working profile without a single unsafe path in it.
         if not has(PROFILE_MARKER):
             raise ArchiveRejected(
-                f"Archive does not contain {PROFILE_MARKER} and does not "
-                "appear to be a Firefox profile backup.\n\nRefusing to "
-                "replace a profile with it."
+                f"Archive does not contain {PROFILE_MARKER} at the top level "
+                "of the profile folder, and does not appear to be a Firefox "
+                "profile backup.\n\nRefusing to replace a profile with it."
             )
         if not has(*ARCHIVE_CORROBORATING):
             raise ArchiveRejected(
@@ -914,7 +951,9 @@ def inspect_backup_archive(zip_path: Path, expected_profile: str | None = None):
             "has_logins": has("logins.json", "key4.db"),
             "has_extensions": has("extensions.json"),
             "has_cookies": has("cookies.sqlite"),
-            "has_session": any("sessionstore" in n for n in names),
+            # Session data legitimately lives in a subfolder as well as at
+            # the root, so this one stays a whole-archive check.
+            "has_session": any("sessionstore" in n for n in relative),
         }
 
 
@@ -952,9 +991,7 @@ def restore_profile(zip_path: Path, profile_path: Path, log):
     """
     info = inspect_backup_archive(zip_path, expected_profile=profile_path.name)
 
-    state = profile_lock_state(profile_path)
-    if state is not LockState.FREE:
-        raise RuntimeError(describe_lock_state(state))
+    require_profile_writable(profile_path)
 
     parent = profile_path.parent
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1183,9 +1220,7 @@ def delete_permission_rows(profile_path: Path, rowids, log):
             + describe_schema_status(status)
         )
 
-    state = profile_lock_state(profile_path)
-    if state is not LockState.FREE:
-        raise RuntimeError(describe_lock_state(state))
+    require_profile_writable(profile_path)
 
     conn = sqlite3.connect(str(db_path))
     try:
@@ -1202,17 +1237,43 @@ def delete_permission_rows(profile_path: Path, rowids, log):
 
 
 def clear_session_restore(profile_path: Path, log):
-    """Remove stored session so a malicious tab doesn't reopen."""
+    """Remove stored session so a malicious tab doesn't reopen.
+
+    Deletion is VERIFIED rather than assumed. rmtree(ignore_errors=True)
+    swallows failures, so a locked or permission-denied sessionstore folder
+    would survive while the tool reported success - and this is precisely
+    the data whose survival brings the scam popups straight back on the next
+    launch. Failure here is therefore loud, not a warning.
+    """
+    require_profile_writable(profile_path)
     removed = 0
+    failed = []
     sessionstore_dir = profile_path / "sessionstore-backups"
     for candidate in [profile_path / "sessionstore.jsonlz4", sessionstore_dir]:
-        if candidate.is_file():
-            candidate.unlink()
-            removed += 1
-        elif candidate.is_dir():
-            shutil.rmtree(candidate, ignore_errors=True)
-            removed += 1
+        if not candidate.exists():
+            continue
+        try:
+            if candidate.is_file():
+                candidate.unlink()
+            else:
+                shutil.rmtree(candidate)
+        except OSError as e:
+            failed.append(f"{candidate.name} ({e})")
+            continue
+        if candidate.exists():      # rmtree can fail partially and silently
+            failed.append(f"{candidate.name} (still present after deletion)")
+            continue
+        removed += 1
+
+    if failed:
+        raise RuntimeError(
+            "Could not remove saved session data:\n  "
+            + "\n  ".join(failed)
+            + "\n\nThe scam tab may reopen when Firefox next starts. Close "
+              "Firefox completely and try again."
+        )
     log(f"Cleared session restore data ({removed} item(s)).")
+    return removed
 
 
 def matching_local_cache_dirs(profile_path: Path):
@@ -1236,19 +1297,41 @@ def matching_local_cache_dirs(profile_path: Path):
 
 
 def clear_cache(profile_path: Path, log):
+    """Delete cache folders for this profile only.
+
+    Unlike session data, a surviving cache folder is not a security problem
+    - it costs disk space and nothing else - so failure is reported as a
+    warning rather than raised. It is still REPORTED: counting a folder as
+    cleared without checking would make the log untrue.
+    """
+    require_profile_writable(profile_path)
     cleared = 0
-    for cache_name in ("cache2", "startupCache", "shader-cache"):
-        c = profile_path / cache_name
-        if c.exists():
-            shutil.rmtree(c, ignore_errors=True)
-            cleared += 1
+    failed = []
+
+    targets = [profile_path / n for n in ("cache2", "startupCache", "shader-cache")]
     # Windows keeps the big cache separately under LOCALAPPDATA
-    for sub in matching_local_cache_dirs(profile_path):
-        c = sub / "cache2"
+    targets += [sub / "cache2" for sub in matching_local_cache_dirs(profile_path)]
+
+    for c in targets:
+        if not c.exists():
+            continue
+        try:
+            shutil.rmtree(c)
+        except OSError as e:
+            failed.append(f"{c} ({e})")
+            continue
         if c.exists():
-            shutil.rmtree(c, ignore_errors=True)
-            cleared += 1
+            failed.append(f"{c} (still present after deletion)")
+            continue
+        cleared += 1
+
     log(f"Cleared {cleared} cache folder(s).")
+    for entry in failed:
+        log(f"  WARNING: could not remove cache folder {entry}")
+    if failed:
+        log(f"  {len(failed)} cache folder(s) could not be removed. This uses "
+            "disk space but is otherwise harmless.")
+    return cleared, tuple(failed)
 
 
 # Firefox's addon signedState values (toolkit/mozapps/extensions).
@@ -1517,7 +1600,7 @@ _LOCK_LABELS = {
 
 def format_health_report(report: dict) -> str:
     lines = [
-        f"{APP_TITLE} - health report",
+        f"{APP_TITLE} {__version__} - health report",
         f"Generated:  {report['generated']}",
         "",
         f"Profile:            {report['profile_name']}",
@@ -1622,7 +1705,7 @@ def write_forensic_snapshot(profile_path: Path, dest_dir: Path, perm_rows,
 
     report = {
         "captured_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "tool": f"{APP_TITLE} forensic snapshot",
+        "tool": f"{APP_TITLE} {__version__} forensic snapshot",
         "profile": {
             "name": profile_path.name,
             "path": str(profile_path),
@@ -1711,7 +1794,7 @@ class Worker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_TITLE)
+        self.setWindowTitle(f"{APP_TITLE} {__version__}")
         self.resize(880, 640)
 
         self.profiles = []

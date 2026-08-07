@@ -68,12 +68,24 @@ The tool never touches Windows system files, the registry, or anything outside t
 - Long operations (backup, restore, cleanup, health scan) run on a background thread, so the window stays responsive and does not appear to have crashed mid-write.
 - SQLite reads copy the `-wal` and `-shm` sidecars alongside the database. In WAL mode recent writes live in the log rather than the main file, so copying only the database can produce a stale scan — the health report warns when pending writes are present.
 - "Profile in use" is reported as `no`, `yes`, or `UNKNOWN`; an inability to determine the state blocks writes but is never reported as fact.
+- Every destructive function re-checks the profile lock immediately before it writes, rather than trusting the check made when you clicked the button — a backup can run for minutes, and Firefox may be started in that window.
+- Deletion of session data is verified, not assumed. If it can't be removed the cleanup fails loudly, because a surviving session is exactly what brings the popups back. A cache folder that can't be removed is reported as a warning instead, since it only costs disk space.
+
+### Known limitation: probe-then-act window
+
+The lock check is a probe, not a held lock: it confirms Firefox isn't using the profile and then releases immediately before the write. Firefox could in principle be launched in the microseconds between. Closing that fully would mean holding an interprocess lock across each mutation using Firefox's own locking semantics, which is substantially more platform-specific than the problem warrants for a family support tool. The realistic window has gone from *minutes* (the duration of a backup) to *microseconds*, and the residual case is documented rather than engineered away.
 
 ## Limitations
 
 - Only manages Firefox profiles registered in `profiles.ini` — profiles you point Firefox at manually via `-profile` won't show up automatically.
 - The ⚠️ flagging is a heuristic (pattern-matching and statistical analysis of the site's address), not a guarantee — always glance over the list yourself before deleting. Each rule has a stable ID (H-01, H-02, ...) shown next to the flagged row and recorded in the cleanup log and forensic snapshot.
-- Flagging and pre-selection are separate. Rules matching known-bad patterns (H-01 to H-04) pre-tick a row; the statistical rule H-05 only flags it for your attention, because legitimate CDN hostnames are genuinely random-looking. Known CDN and hosting providers are never pre-ticked at all.
+- Flagging and pre-selection are separate, and pre-selection follows an evidence hierarchy:
+  - **H-03** identifies a named known scam network. That is direct evidence, so it can pre-select an entry on its own.
+  - **H-01, H-02 and H-04** are circumstantial signals about the *shape* of a hostname. At least two must agree before an entry is pre-selected, because any single shape rule also matches legitimate sites — `.co.in` is an ordinary Indian commercial domain, and real CDN hostnames look random.
+  - **H-05** is statistical and advisory only. It flags an entry for your attention but never pre-selects one.
+  - Known CDN and hosting providers are never pre-selected regardless of which rule matched.
+
+  Everything flagged is still listed and can be ticked manually. The hierarchy only governs what arrives pre-ticked.
 - Write operations (clean, restore) are refused outright while Firefox has the profile open, and also if that cannot be determined. Backups are read-only and proceed with a warning.
 - Extension review is read-only; disable or remove unfamiliar extensions from within Firefox (`about:addons`), then re-check the list here.
 - If Firefox is running, database writes (clean/restore) can fail or be incomplete — always close it first.
@@ -87,6 +99,10 @@ pytest -q
 
 The suite pins the local-cache scoping behaviour: reverting
 `matching_local_cache_dirs()` to a prefix match makes it fail.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
